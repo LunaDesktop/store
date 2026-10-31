@@ -1,5 +1,7 @@
 # Luna Store
 
+> [Polski](README.pl.md) · [English](README.en.md) · [Deutsch](README.de.md)
+
 Sklep z oprogramowaniem Luny na libLunie: natywne menedżery pakietów
 (pacman, pag, apt, dnf, emerge), Flatpak i aktualizacje.
 
