@@ -1,0 +1,33 @@
+[package]
+name = "luna-store"
+version = "0.0.1"
+edition = "2021"
+license = "GPL-3.0-or-later"
+rust-version = "1.80"
+authors = ["Patryk Szkudlarek / libLuna contributors"]
+description = "Luna Store — sklep z oprogramowaniem, aplikacjami Flatpak i aktualizacjami (libLuna, bez GTK)."
+# Po utworzeniu osobnego repozytorium ustaw np.:
+# repository = "https://github.com/mijsys/luna-store"
+
+[workspace]
+resolver = "2"
+
+[dependencies]
+libluna-core = { path = "../../libluna/crates/libluna-core", version = "0.0.5" }
+libluna-i18n = { path = "../../libluna/crates/libluna-i18n", version = "0.0.5" }
+libluna-render = { path = "../../libluna/crates/libluna-render", version = "0.0.5" }
+libluna-platform = { path = "../../libluna/crates/libluna-platform", version = "0.0.5" }
+libluna-widgets = { path = "../../libluna/crates/libluna-widgets", version = "0.0.5" }
+serde_json = "1.0"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
