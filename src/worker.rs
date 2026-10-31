@@ -31,6 +31,16 @@ impl ActionKind {
     }
 }
 
+/// Jedna pozycja instalacji zbiorczej (zaznaczone pakiety).
+#[derive(Debug, Clone)]
+pub struct BulkAction {
+    pub repo: RepoConfig,
+    pub kind: ActionKind,
+    pub id: String,
+    pub name: String,
+    pub remote: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Job {
     Catalog(RepoConfig),
@@ -43,6 +53,11 @@ pub enum Job {
         name: String,
         remote: Option<String>,
     },
+    /// Kilka instalacji/aktualizacji wykonywanych po kolei w jednym wątku.
+    ///
+    /// Sekwencyjnie, bo menedżery pakietów blokują własną bazę — równoległe
+    /// wywołania kończyłyby się błędem „database is locked”.
+    Bulk(Vec<BulkAction>),
     UpdateAll(Vec<RepoConfig>),
 }
 
@@ -75,6 +90,8 @@ pub enum JobResult {
         description: String,
     },
     ActionDone(ActionOutcome),
+    /// Wyniki instalacji zbiorczej (po jednym na zaznaczony pakiet).
+    BulkDone(Vec<ActionOutcome>),
 }
 
 impl Job {
@@ -83,7 +100,7 @@ impl Job {
             Job::Catalog(repo) | Job::Status(repo) => Some(repo.id.clone()),
             Job::Describe(repo, _) => Some(repo.id.clone()),
             Job::Action { repo, .. } => Some(repo.id.clone()),
-            Job::UpdateAll(_) => None,
+            Job::Bulk(_) | Job::UpdateAll(_) => None,
         }
     }
 
@@ -144,8 +161,55 @@ impl Job {
                     ActionKind::UpdateAll => OpKind::UpdateAll,
                 };
                 let result = backends::operations(repo, op, id, remote.as_deref())
-                    .and_then(|operations| backends::execute(settings, &operations));
+                    .and_then(|operations| run_operations(settings, &operations));
                 outcome(*kind, name.clone(), result, Some(repo.id.clone()))
+            }
+            Job::Bulk(items) => {
+                let mut outcomes = Vec::with_capacity(items.len());
+                for item in items {
+                    let op = match item.kind {
+                        ActionKind::Install => OpKind::Install,
+                        ActionKind::Remove => OpKind::Remove,
+                        ActionKind::Update => OpKind::Update,
+                        ActionKind::UpdateAll => OpKind::UpdateAll,
+                    };
+                    let result =
+                        backends::operations(&item.repo, op, &item.id, item.remote.as_deref())
+                            .and_then(|operations| run_operations(settings.clone(), &operations));
+                    let outcome = match result {
+                        Ok(log) => ActionOutcome {
+                            kind: item.kind,
+                            name: item.name.clone(),
+                            success: true,
+                            detail: (!log.is_empty()).then_some(log),
+                            source: Some(item.repo.id.clone()),
+                        },
+                        Err(error) => ActionOutcome {
+                            kind: item.kind,
+                            name: item.name.clone(),
+                            success: false,
+                            detail: Some(error),
+                            source: Some(item.repo.id.clone()),
+                        },
+                    };
+                    // Błędne hasło dotyczy całej serii — nie ma sensu wywoływać
+                    // kolejnych menedżerów z tym samym (złym) hasłem.
+                    let auth_error = outcome
+                        .detail
+                        .as_deref()
+                        .map(|detail| {
+                            let lower = detail.to_lowercase();
+                            lower.contains("sorry, try again")
+                                || lower.contains("incorrect password")
+                                || lower.contains("authentication failure")
+                        })
+                        .unwrap_or(false);
+                    outcomes.push(outcome);
+                    if auth_error {
+                        break;
+                    }
+                }
+                JobResult::BulkDone(outcomes)
             }
             Job::UpdateAll(repos) => {
                 let mut updated = 0usize;
@@ -153,7 +217,7 @@ impl Job {
                 let mut names = Vec::new();
                 for repo in repos {
                     match backends::operations(repo, OpKind::UpdateAll, "", None)
-                        .and_then(|operations| backends::execute(settings, &operations))
+                        .and_then(|operations| run_operations(settings.clone(), &operations))
                     {
                         Ok(_) => updated += 1,
                         Err(error) => {
@@ -219,7 +283,30 @@ impl Job {
                 detail: Some("wątek backendu został przerwany".to_owned()),
                 source: None,
             }),
+            Job::Bulk(items) => JobResult::BulkDone(
+                items
+                    .iter()
+                    .map(|item| ActionOutcome {
+                        kind: item.kind,
+                        name: item.name.clone(),
+                        success: false,
+                        detail: Some("wątek backendu został przerwany".to_owned()),
+                        source: Some(item.repo.id.clone()),
+                    })
+                    .collect(),
+            ),
         }
+    }
+}
+
+/// Wykonuje operacje przez wspólny dziennik, jeśli cache jest dostępny.
+fn run_operations(
+    settings: WorkerSettings,
+    operations: &[backends::Operation],
+) -> Result<String, String> {
+    match crate::oplog::log_path() {
+        Some(path) => backends::execute_logged(settings, operations, &path),
+        None => backends::execute(settings, operations),
     }
 }
 
@@ -265,8 +352,19 @@ impl JobRunner {
     }
 
     pub fn spawn(&self, job: Job) {
+        self.spawn_with(self.settings.clone(), job);
+    }
+
+    /// Uruchamia zadanie z hasłem administratora podanym w aplikacji.
+    ///
+    /// Hasło trafia tylko do `sudo -S` w wątku roboczym; nie jest zapisywane
+    /// w dzienniku ani w argumentach polecenia.
+    pub fn spawn_with_password(&self, job: Job, password: Option<String>) {
+        self.spawn_with(self.settings.clone().with_password(password), job);
+    }
+
+    fn spawn_with(&self, settings: WorkerSettings, job: Job) {
         let tx = self.tx.clone();
-        let settings = self.settings;
         let fallback = job.clone();
         let if_unspawned = job.clone();
         let spawned = std::thread::Builder::new()

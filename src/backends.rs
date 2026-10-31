@@ -11,6 +11,8 @@
 //! administratora/użytkownika.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -20,14 +22,24 @@ use crate::config::{which, Privilege, RepoConfig};
 use crate::model::{compare_versions, BackendKind, RawPackage};
 
 /// Ustawienia przekazywane do wątku roboczego.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct WorkerSettings {
     pub privilege: Privilege,
+    /// Hasło administratora podane w aplikacji (tylko dla `sudo -S`).
+    pub password: Option<String>,
 }
 
 impl WorkerSettings {
     pub fn new(privilege: Privilege) -> Self {
-        Self { privilege }
+        Self {
+            privilege,
+            password: None,
+        }
+    }
+
+    pub fn with_password(mut self, password: Option<String>) -> Self {
+        self.password = password;
+        self
     }
 }
 
@@ -65,7 +77,7 @@ struct Output {
     code: Option<i32>,
 }
 
-fn run_program(program: &str, args: &[String]) -> Result<Output, String> {
+fn run_program(program: &str, args: &[String], password: Option<&str>) -> Result<Output, String> {
     let mut command = Command::new(program);
     command
         .args(args)
@@ -73,10 +85,24 @@ fn run_program(program: &str, args: &[String]) -> Result<Output, String> {
         .env("LANG", "C")
         .env("DEBIAN_FRONTEND", "noninteractive")
         .env("PAG_LANG", "en")
-        .stdin(Stdio::null());
-    let output = command
-        .output()
-        .map_err(|err| format!("{program}: {err}"))?;
+        .stdin(if password.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+    let output = if let Some(password) = password {
+        let mut child = command.spawn().map_err(|err| format!("{program}: {err}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = writeln!(stdin, "{password}");
+        }
+        child
+            .wait_with_output()
+            .map_err(|err| format!("{program}: {err}"))?
+    } else {
+        command
+            .output()
+            .map_err(|err| format!("{program}: {err}"))?
+    };
     Ok(Output {
         ok: output.status.success(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -86,7 +112,7 @@ fn run_program(program: &str, args: &[String]) -> Result<Output, String> {
 }
 
 fn query(program: &str, args: &[String]) -> Result<String, String> {
-    let output = run_program(program, args)?;
+    let output = run_program(program, args, None)?;
     if output.ok {
         Ok(output.stdout)
     } else {
@@ -96,7 +122,7 @@ fn query(program: &str, args: &[String]) -> Result<String, String> {
 
 /// Jak `query`, ale brak aktualizacji (kod != 0 bez komunikatu) nie jest błędem.
 fn query_optional(program: &str, args: &[String]) -> Result<String, String> {
-    let output = run_program(program, args)?;
+    let output = run_program(program, args, None)?;
     if output.ok || (output.stdout.trim().is_empty() && output.stderr.trim().is_empty()) {
         Ok(output.stdout)
     } else {
@@ -144,14 +170,120 @@ fn tail_lines(text: &str, max: usize) -> String {
 pub fn execute(settings: WorkerSettings, operations: &[Operation]) -> Result<String, String> {
     let mut log = String::new();
     for operation in operations {
-        let (program, args) = apply_privilege(settings, operation)?;
-        let output = run_program(&program, &args)?;
+        let wrapped = apply_privilege(settings.clone(), operation)?;
+        let password = if wrapped.sudo_password {
+            settings.password.as_deref()
+        } else {
+            None
+        };
+        let output = run_program(&wrapped.program, &wrapped.args, password)?;
         if !output.ok {
-            return Err(failure(&program, &output));
+            return Err(failure(&wrapped.program, &output));
         }
         log = tail_lines(&output.stdout, 10);
     }
     Ok(log)
+}
+
+/// Wykonuje polecenia, strumieniując wyjście do wspólnego dziennika operacji.
+///
+/// Dzięki strumieniowaniu strona „Status” widzi postęp **na żywo**, a proces
+/// `pkexec` pisze do pliku także wtedy, gdy okno sklepu zostanie zamknięte.
+pub fn execute_logged(
+    settings: WorkerSettings,
+    operations: &[Operation],
+    log: &Path,
+) -> Result<String, String> {
+    if let Some(parent) = log.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
+    }
+    // Prosty obrót: dziennik nie rośnie w nieskończoność między aktualizacjami.
+    if std::fs::metadata(log).is_ok_and(|meta| meta.len() > 1_000_000) {
+        let _ = std::fs::write(log, "");
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .map_err(|err| format!("{}: {err}", log.display()))?;
+    // PID śledzimy tylko dla właściwego dziennika użytkownika (testy używają tmp).
+    let track_pid = crate::oplog::log_path().as_deref() == Some(log);
+
+    for operation in operations {
+        let wrapped = apply_privilege(settings.clone(), operation)?;
+        let password = if wrapped.sudo_password {
+            settings.password.as_deref()
+        } else {
+            None
+        };
+        let program = wrapped.program;
+        let args = wrapped.args;
+        let mut command_line = vec![program.clone()];
+        command_line.extend(args.iter().cloned());
+        let _ = writeln!(file, "$ {}", command_line.join(" "));
+        let _ = file.flush();
+
+        let stdout = Stdio::from(
+            file.try_clone()
+                .map_err(|err| format!("{}: {err}", log.display()))?,
+        );
+        let stderr = Stdio::from(
+            file.try_clone()
+                .map_err(|err| format!("{}: {err}", log.display()))?,
+        );
+        let mut child = Command::new(&program)
+            .args(&args)
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .env("DEBIAN_FRONTEND", "noninteractive")
+            .env("PAG_LANG", "en")
+            .stdin(if password.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()
+            .map_err(|err| format!("{program}: {err}"))?;
+        if let (Some(password), Some(mut stdin)) = (password, child.stdin.take()) {
+            // Hasło idzie przez stdin, nigdy przez argv ani dziennik.
+            let _ = writeln!(stdin, "{password}");
+        }
+        let pid = child.id();
+        if track_pid {
+            crate::oplog::write_pid(pid);
+        }
+        let status = child.wait().map_err(|err| format!("{program}: {err}"))?;
+        if track_pid {
+            crate::oplog::clear_pid(pid);
+        }
+        let code = status.code();
+        let _ = writeln!(
+            file,
+            "[exit {}]",
+            code.map_or_else(|| "?".to_owned(), |code| code.to_string())
+        );
+        let _ = file.flush();
+
+        if !status.success() {
+            let detail = std::fs::read_to_string(log)
+                .ok()
+                .map(|text| tail_lines(&text, 10))
+                .unwrap_or_default();
+            let code = code.map_or_else(String::new, |code| format!(" (kod {code})"));
+            return Err(if detail.is_empty() {
+                format!("{program}{code}")
+            } else {
+                format!("{program}{code}: {detail}")
+            });
+        }
+    }
+
+    Ok(std::fs::read_to_string(log)
+        .ok()
+        .map(|text| tail_lines(&text, 10))
+        .unwrap_or_default())
 }
 
 /// Ścieżka narzędzia do podnoszenia uprawnień (PKEXEC/SUDO) niezależnie od PATH.
@@ -159,44 +291,73 @@ fn privilege_program(name: &str) -> Option<String> {
     which(name).map(|path| path.display().to_string())
 }
 
-fn apply_privilege(
-    settings: WorkerSettings,
-    operation: &Operation,
-) -> Result<(String, Vec<String>), String> {
+/// Jedno polecenie po opakowaniu w narzędzie podnoszenia uprawnień.
+struct Wrapped {
+    program: String,
+    args: Vec<String>,
+    /// Czy do `stdin` trzeba podać hasło (`sudo -S`).
+    sudo_password: bool,
+}
+
+fn apply_privilege(settings: WorkerSettings, operation: &Operation) -> Result<Wrapped, String> {
     if !operation.privileged {
-        return Ok((operation.program.clone(), operation.args.clone()));
+        return Ok(Wrapped {
+            program: operation.program.clone(),
+            args: operation.args.clone(),
+            sudo_password: false,
+        });
     }
     let resolved = which(&operation.program)
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| operation.program.clone());
-    let wrap = |program: String, prefix: &[&str]| {
-        (
-            program,
-            prefix
-                .iter()
-                .map(|arg| (*arg).to_owned())
-                .chain(std::iter::once(resolved.clone()))
-                .chain(operation.args.clone())
-                .collect(),
-        )
+    let wrap = |program: String, prefix: &[&str], sudo_password: bool| Wrapped {
+        program,
+        args: prefix
+            .iter()
+            .map(|arg| (*arg).to_owned())
+            .chain(std::iter::once(resolved.clone()))
+            .chain(operation.args.clone())
+            .collect(),
+        sudo_password,
+    };
+    let sudo = |settings: &WorkerSettings| -> Result<Wrapped, String> {
+        let Some(sudo) = privilege_program("sudo") else {
+            return Err(missing_authorization());
+        };
+        if settings.password.is_some() {
+            // `-S` czyta hasło ze stdin; `-k` czyści cache, więc każde działanie
+            // naprawdę prosi o hasło. `-p ""` nie zaśmieca dziennika napisem
+            // „[sudo] password for …”.
+            Ok(wrap(sudo, &["-S", "-k", "-p", ""], true))
+        } else if crate::admin::sudo_usable() {
+            Ok(wrap(sudo, &["-n"], false))
+        } else {
+            Err(missing_authorization())
+        }
     };
     match settings.privilege {
-        Privilege::None => Ok((resolved, operation.args.clone())),
+        Privilege::None => Ok(Wrapped {
+            program: resolved,
+            args: operation.args.clone(),
+            sudo_password: false,
+        }),
         Privilege::Pkexec => match privilege_program("pkexec") {
-            Some(pkexec) => Ok(wrap(pkexec, &[])),
+            Some(pkexec) => Ok(wrap(pkexec, &[], false)),
             None => Err(missing_authorization()),
         },
-        Privilege::Sudo => match privilege_program("sudo") {
-            Some(sudo) => Ok(wrap(sudo, &["-n"])),
-            None => Err(missing_authorization()),
-        },
-        // Auto: preferujemy pkexec, bo tylko on pokazuje okno autoryzacji Polkit
-        // (w Lunie rysuje je `luna-polkit`). Nie uruchamiamy operacji bez uprawnień
-        // po cichu — lepiej pokazać jasny błąd w UI.
-        Privilege::Auto => match privilege_program("pkexec") {
-            Some(pkexec) => Ok(wrap(pkexec, &[])),
-            None => Err(missing_authorization()),
-        },
+        Privilege::Sudo => sudo(&settings),
+        // Auto: pkexec (okno polkit), a gdy pkexec nie jest setuid root — sudo
+        // z hasłem z formularza aplikacji (tak działa m.in. PaganOS 0.5.3).
+        Privilege::Auto => {
+            if crate::admin::pkexec_usable() {
+                match privilege_program("pkexec") {
+                    Some(pkexec) => Ok(wrap(pkexec, &[], false)),
+                    None => sudo(&settings),
+                }
+            } else {
+                sudo(&settings)
+            }
+        }
     }
 }
 
@@ -878,7 +1039,8 @@ pub fn operations(
         BackendKind::Pag => match kind {
             OpKind::Install | OpKind::Update => vec![op("pag", &["install", "-y", id], true)],
             OpKind::Remove => vec![op("pag", &["remove", "-y", id], true)],
-            OpKind::UpdateAll => vec![op("pag", &["update", "-y"], true)],
+            // `pag update` odświeża tylko indeksy; aktualizacje systemu robi `upgrade`.
+            OpKind::UpdateAll => vec![op("pag", &["upgrade", "-y"], true)],
         },
         BackendKind::Apt => {
             // W GUI nie ma terminala do pytań dpkg — wybieramy bezpieczne
@@ -1779,6 +1941,34 @@ mod tests {
     }
 
     #[test]
+    fn pag_update_all_uses_upgrade() {
+        let ops = operations(&repo(BackendKind::Pag), OpKind::UpdateAll, "", None).unwrap();
+        assert_eq!(ops[0].program, "pag");
+        assert_eq!(ops[0].args, vec!["upgrade", "-y"]);
+    }
+
+    #[test]
+    fn execute_logged_streams_output_to_file() {
+        let dir = std::env::temp_dir().join(format!("luna-store-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("operations.log");
+        let op = Operation {
+            program: "sh".into(),
+            args: vec!["-c".into(), "echo hello".into()],
+            privileged: false,
+        };
+        let result = execute_logged(WorkerSettings::new(Privilege::None), &[op], &log)
+            .expect("dziennik operacji");
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains("$ sh -c echo hello"), "{text}");
+        assert!(text.contains("hello"), "{text}");
+        assert!(text.contains("[exit 0]"), "{text}");
+        assert!(result.contains("hello"), "{result}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn custom_command_substitutes_package_and_remote() {
         let mut custom = repo(BackendKind::Custom);
         custom.overrides.install = Some("pkexec own install --remote {remote} {package}".into());
@@ -1803,35 +1993,51 @@ mod tests {
 
     #[test]
     fn privilege_none_runs_command_directly() {
-        let (program, args) =
+        let wrapped =
             apply_privilege(WorkerSettings::new(Privilege::None), &privileged_op()).unwrap();
-        assert_eq!(program, "pacman");
-        assert_eq!(args, vec!["-S", "bash"]);
+        assert_eq!(wrapped.program, "pacman");
+        assert_eq!(wrapped.args, vec!["-S", "bash"]);
+        assert!(!wrapped.sudo_password);
     }
 
     #[test]
-    fn auto_uses_pkexec_when_available() {
-        if which("pkexec").is_none() {
-            return;
-        }
-        let (program, args) =
+    fn auto_uses_pkexec_only_when_setuid() {
+        let wrapped =
             apply_privilege(WorkerSettings::new(Privilege::Auto), &privileged_op()).unwrap();
-        assert!(program.ends_with("pkexec"), "{program}");
-        // pkexec dostaje najpierw **ścieżkę** programu, potem jego argumenty.
-        assert!(args[0].ends_with("pacman"), "{args:?}");
-        assert_eq!(&args[1..], ["-S", "bash"]);
+        if crate::admin::pkexec_usable() {
+            assert!(wrapped.program.ends_with("pkexec"), "{}", wrapped.program);
+            assert!(wrapped.args[0].ends_with("pacman"));
+            assert_eq!(&wrapped.args[1..], ["-S", "bash"]);
+        } else {
+            // Bez setuid pkexec Auto przechodzi na sudo (z hasłem z UI albo -n).
+            assert!(wrapped.program.ends_with("sudo"), "{}", wrapped.program);
+        }
     }
 
     #[test]
-    fn sudo_runs_non_interactively() {
+    fn sudo_runs_non_interactively_without_password() {
         if which("sudo").is_none() {
             return;
         }
-        let (program, args) =
+        let wrapped =
             apply_privilege(WorkerSettings::new(Privilege::Sudo), &privileged_op()).unwrap();
-        assert!(program.ends_with("sudo"), "{program}");
-        assert_eq!(args[0], "-n");
-        assert!(args[1].ends_with("pacman"));
+        assert!(wrapped.program.ends_with("sudo"), "{}", wrapped.program);
+        assert_eq!(wrapped.args[0], "-n");
+        assert!(wrapped.args[1].ends_with("pacman"));
+        assert!(!wrapped.sudo_password);
+    }
+
+    #[test]
+    fn sudo_with_password_reads_it_from_stdin() {
+        if which("sudo").is_none() {
+            return;
+        }
+        let settings = WorkerSettings::new(Privilege::Sudo).with_password(Some("tajne".into()));
+        let wrapped = apply_privilege(settings, &privileged_op()).unwrap();
+        assert!(wrapped.program.ends_with("sudo"), "{}", wrapped.program);
+        assert_eq!(&wrapped.args[..4], ["-S", "-k", "-p", ""]);
+        assert!(wrapped.sudo_password);
+        assert!(!wrapped.args.iter().any(|arg| arg == "tajne"));
     }
 
     #[test]
@@ -1847,9 +2053,10 @@ mod tests {
             Privilege::Sudo,
             Privilege::None,
         ] {
-            let (program, args) = apply_privilege(WorkerSettings::new(privilege), &op).unwrap();
-            assert_eq!(program, "flatpak");
-            assert_eq!(args, vec!["install"]);
+            let wrapped = apply_privilege(WorkerSettings::new(privilege), &op).unwrap();
+            assert_eq!(wrapped.program, "flatpak");
+            assert_eq!(wrapped.args, vec!["install"]);
+            assert!(!wrapped.sudo_password);
         }
     }
 }

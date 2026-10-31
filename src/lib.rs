@@ -15,11 +15,14 @@
 //! luna_store::run().unwrap();
 //! ```
 
+pub mod admin;
 pub mod app;
 pub mod backends;
 pub mod cache;
 pub mod config;
 pub mod model;
+pub mod notify;
+pub mod oplog;
 pub mod ui;
 pub mod worker;
 

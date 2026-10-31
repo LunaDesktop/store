@@ -1,7 +1,7 @@
 //! Renderuje Luna Store do PNG — podgląd bez kompozytora Wayland.
 //!
 //! Użycie:
-//!   `cargo run --bin store-render -- [--dark] [--lang CODE] [--page all|installed|updates] [--details] [--menu] [--list] [--search QUERY] [wyjście.png]`
+//!   `cargo run --bin store-render -- [--dark] [--lang CODE] [--page all|installed|updates] [--details] [--menu] [--list] [--search QUERY] [--status] [--about] [--config] [wyjście.png]`
 //!
 //! Dane pochodzą z aktywnych źródeł (tak jak w działającej aplikacji), ale
 //! pobierane są synchronicznie — to narzędzie deweloperskie, nie ścieżka UI.
@@ -25,6 +25,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut details = false;
     let mut menu = false;
     let mut list = false;
+    let mut status = false;
+    let mut about = false;
+    let mut config = false;
     let mut search: Option<String> = None;
     let mut out: Option<String> = None;
 
@@ -51,6 +54,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             "--list" => {
                 list = true;
+                index += 1;
+            }
+            "--status" => {
+                status = true;
+                index += 1;
+            }
+            "--about" => {
+                about = true;
+                index += 1;
+            }
+            "--config" => {
+                config = true;
                 index += 1;
             }
             "--search" => {
@@ -112,6 +127,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(query) = &search {
         app.search.set_text(query.clone());
         app.on_query_changed();
+    }
+    if status {
+        app.go_to(Page::Status);
+    }
+    if about {
+        app.show_about();
+    }
+    if config {
+        if app.config.path.is_none() {
+            app.config.path = Some(std::path::PathBuf::from(
+                "/home/luna/.config/luna/store/repositories.conf",
+            ));
+        }
+        app.open_configuration();
     }
     if details {
         if let Some(&index) = app.view.first() {

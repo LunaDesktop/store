@@ -26,6 +26,30 @@ fn stamp_path(source: &str) -> Option<PathBuf> {
     cache_dir().map(|dir| dir.join(format!("{}.stamp", safe_name(source))))
 }
 
+fn notified_path() -> Option<PathBuf> {
+    cache_dir().map(|dir| dir.join("notified-updates"))
+}
+
+/// Liczba aktualizacji, o których powiadomiliśmy w poprzednich uruchomieniach.
+///
+/// Dzięki temu ponowne otwarcie Sklepu nie powtarza tego samego powiadomienia.
+pub fn load_notified_updates() -> usize {
+    notified_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+pub fn save_notified_updates(count: usize) {
+    let Some(path) = notified_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, count.to_string());
+}
+
 fn safe_name(source: &str) -> String {
     source
         .chars()

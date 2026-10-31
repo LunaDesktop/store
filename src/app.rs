@@ -9,18 +9,18 @@ use std::error::Error;
 use std::time::{Duration, Instant, SystemTime};
 
 use libluna_core::ThemeSettings;
-use libluna_i18n::{set_locale, tr};
+use libluna_i18n::{set_locale, tr, tr_args};
 use libluna_platform::{run as run_app, AppConfig, Frame};
 use libluna_widgets::{
-    BottomSheet, Entry, EntryIcon, IconName, Menu, MenuEntry, NavEntry, NavList, ScrollView,
-    StatusIcon, StatusPage, Toast, ViewMode, WindowControl,
+    AlertDialog, BottomSheet, Entry, EntryIcon, IconName, Menu, MenuEntry, NavEntry, NavList,
+    PasswordEntry, ScrollView, StatusIcon, StatusPage, Toast, ViewMode, WindowControl,
 };
 
 use crate::backends::valid_package;
 use crate::cache;
 use crate::config::{Privilege, RepoConfig, StoreConfig};
 use crate::model::{package_key, BackendKind, Package, RawPackage};
-use crate::worker::{ActionKind, Job, JobResult, JobRunner};
+use crate::worker::{ActionKind, BulkAction, Job, JobResult, JobRunner};
 
 /// Strona główna lub jedno źródło pakietów.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -29,6 +29,8 @@ pub enum Page {
     All,
     Installed,
     Updates,
+    /// Podgląd operacji w tle (daemon aktualizacji, dziennik, historia).
+    Status,
     Source(String),
 }
 
@@ -63,6 +65,47 @@ struct ViewSignature {
     query: String,
 }
 
+/// Zakończona operacja widoczna na stronie „Status”.
+#[derive(Debug, Clone)]
+pub struct OpRecord {
+    pub kind: ActionKind,
+    pub name: String,
+    pub success: bool,
+    pub detail: Option<String>,
+    pub finished: SystemTime,
+}
+
+/// Co ma się stać po podaniu hasła administratora.
+#[derive(Debug, Clone)]
+pub enum PendingAuth {
+    Action {
+        package: Box<Package>,
+        kind: ActionKind,
+    },
+    UpdateAll,
+    /// Instalacja/aktualizacja zaznaczonych pakietów jednym hasłem.
+    InstallMany(Vec<Package>),
+}
+
+/// Modalne okno hasła administratora (gdy `pkexec` nie jest setuid).
+pub struct AuthPrompt {
+    pub pending: PendingAuth,
+    pub password: PasswordEntry,
+    pub error: Option<String>,
+}
+
+impl AuthPrompt {
+    pub fn new(pending: PendingAuth, error: Option<String>) -> Self {
+        let mut password = PasswordEntry::new(tr("Administrator password"));
+        password.set_focused(true);
+        Self {
+            pending,
+            password,
+            error,
+        }
+    }
+}
+
 /// Zmiany, które trzeba zastosować do `Frame` po obsłudze zdarzeń.
 #[derive(Debug, Default)]
 pub struct Pending {
@@ -87,6 +130,12 @@ pub struct App {
     /// Siatka albo lista (przełącznik w headerbarze).
     pub view_mode: ViewMode,
     pub search: Entry,
+    /// Czy pole wyszukiwania jest pokazane (przycisk lupy jak w Luna Files).
+    pub search_active: bool,
+    /// Tryb zaznaczania wielu pakietów (przycisk ✓ w headerbarze).
+    pub select_mode: bool,
+    /// Klucze zaznaczonych pakietów (`Package::key`).
+    pub selection: HashSet<String>,
     pub scroll: ScrollView,
     pub packages: Vec<Package>,
     pub view: Vec<usize>,
@@ -98,8 +147,31 @@ pub struct App {
     /// Etykieta trwającej instalacji/usuwania/aktualizacji.
     pub working: Option<String>,
     pub selected: Option<String>,
+    /// Pakiet do otwarcia po wczytaniu katalogów (CLI `--package`, np. z launchera).
+    pending_open: Option<String>,
     pub confirm_remove: bool,
     pub sheet: BottomSheet,
+    /// Okno „O aplikacji”.
+    pub about: Option<AlertDialog>,
+    /// Okno „Konfiguracja repozytorium”.
+    pub config_info: Option<AlertDialog>,
+    /// Potwierdzenie „Aktualizuj wszystko” (z informacją o haśle).
+    pub confirm_update_all: Option<AlertDialog>,
+    /// Modalne okno hasła administratora (fallback bez sprawnego pkexec).
+    pub auth: Option<AuthPrompt>,
+    /// Ostatnia operacja oczekująca na hasło (do ponownego pytania).
+    pub last_auth: Option<PendingAuth>,
+    /// Historia zakończonych operacji (strona „Status”).
+    pub op_history: Vec<OpRecord>,
+    /// Liczba aktualizacji, o których już powiadomiliśmy (żeby nie spamować).
+    notified_updates: usize,
+    /// Ogon dziennika operacji (odświeżany w `tick`).
+    pub op_log: Vec<String>,
+    log_read_at: Instant,
+    /// Kiedy zaczął się trwający proces (do licznika na stronie Status).
+    pub op_started: Option<Instant>,
+    /// Czy trwa operacja zapisana w cache (np. pkexec po restarcie UI).
+    pub background: bool,
     pub toast: Toast,
     pub toast_until: Option<Instant>,
     pub spinner: f64,
@@ -108,6 +180,10 @@ pub struct App {
     pub hover_card: Option<usize>,
     pub hover_action: bool,
     pub hover_refresh: bool,
+    pub hover_search: bool,
+    pub hover_select: bool,
+    pub hover_install_all: bool,
+    pub hover_clear_selection: bool,
     pub hover_sidebar: bool,
     pub hover_menu: bool,
     pub hover_back: bool,
@@ -170,6 +246,9 @@ impl App {
             search: Entry::new(tr("Search apps…"))
                 .leading(EntryIcon::Search)
                 .clearable(true),
+            search_active: false,
+            select_mode: false,
+            selection: HashSet::new(),
             scroll: ScrollView::new(),
             packages: Vec::new(),
             view: Vec::new(),
@@ -179,8 +258,20 @@ impl App {
             loading: HashMap::new(),
             working: None,
             selected: None,
+            pending_open: None,
             confirm_remove: false,
             sheet: BottomSheet::new(),
+            about: None,
+            config_info: None,
+            confirm_update_all: None,
+            auth: None,
+            last_auth: None,
+            op_history: Vec::new(),
+            notified_updates: cache::load_notified_updates(),
+            op_log: Vec::new(),
+            log_read_at: Instant::now() - Duration::from_secs(10),
+            op_started: None,
+            background: false,
             toast: Toast::default(),
             toast_until: None,
             spinner: 0.0,
@@ -189,6 +280,10 @@ impl App {
             hover_card: None,
             hover_action: false,
             hover_refresh: false,
+            hover_search: false,
+            hover_select: false,
+            hover_install_all: false,
+            hover_clear_selection: false,
             hover_sidebar: false,
             hover_menu: false,
             hover_back: false,
@@ -250,19 +345,48 @@ impl App {
         }
     }
 
+    /// Pyta o potwierdzenie aktualizacji wszystkich pakietów.
+    ///
+    /// Samo potwierdzenie nie podnosi uprawnień — po „Aktualizuj wszystko”
+    /// menedżer pakietów idzie przez `pkexec`, więc polkit pokaże okno hasła.
     pub fn update_all(&mut self) {
         if self.working.is_some() {
             self.show_toast(tr("Another operation is running"));
             return;
         }
+        let count = self.update_count();
+        if count == 0 {
+            self.show_toast(tr("No updates"));
+            return;
+        }
+        let body = tr_args(
+            "{n} packages will be updated. Administrator authorization is required.",
+            &[("n", &count.to_string())],
+        );
+        self.confirm_update_all = Some(
+            AlertDialog::new(tr("Update all"), body)
+                .width(560.0)
+                .button(tr("Update all"))
+                .button(tr("Cancel")),
+        );
+    }
+
+    /// Odpowiedź na okno potwierdzenia „Aktualizuj wszystko”.
+    pub fn answer_update_all(&mut self, confirmed: bool) {
+        self.confirm_update_all = None;
+        if confirmed {
+            self.perform_update_all(None);
+        }
+    }
+
+    fn perform_update_all(&mut self, password: Option<String>) {
         let repos: Vec<RepoConfig> = self
             .repos
             .iter()
             .filter(|repo| {
                 self.updates
                     .get(&repo.cfg.id)
-                    .map(|updates| !updates.is_empty())
-                    .unwrap_or(false)
+                    .is_some_and(|updates| !updates.is_empty())
             })
             .map(|repo| repo.cfg.clone())
             .collect();
@@ -270,9 +394,32 @@ impl App {
             self.show_toast(tr("No updates"));
             return;
         }
+        if self.config.privilege != Privilege::None
+            && crate::admin::needs_password_prompt(self.config.privilege)
+        {
+            if password.is_none() {
+                if !crate::admin::available(self.config.privilege) {
+                    self.show_toast(tr("Administrator authorization is unavailable"));
+                    return;
+                }
+                self.auth = Some(AuthPrompt::new(PendingAuth::UpdateAll, None));
+                return;
+            }
+        } else if self.config.privilege != Privilege::None && password.is_none() {
+            self.show_toast(tr("Authorization requested — check the system dialog"));
+        }
         self.working = Some(tr("Updating all sources…"));
+        self.op_started = Some(Instant::now());
+        if password.is_some() {
+            self.last_auth = Some(PendingAuth::UpdateAll);
+        }
         self.close_details();
-        self.runner.spawn(Job::UpdateAll(repos));
+        self.search.set_focused(false);
+        crate::oplog::append(&format!("== {} ==", tr("Updating all sources…")));
+        self.runner
+            .spawn_with_password(Job::UpdateAll(repos), password);
+        // Aktualizacja masowa działa w tle — od razu pokazujemy jej status.
+        self.go_to(Page::Status);
     }
 
     pub fn start_action(&mut self, package: &Package, kind: ActionKind) {
@@ -293,29 +440,92 @@ impl App {
             self.show_toast(tr("Source is not available"));
             return;
         };
+        if self.config.privilege != Privilege::None && needs_admin(&repo) {
+            if crate::admin::needs_password_prompt(self.config.privilege) {
+                if !crate::admin::available(self.config.privilege) {
+                    self.show_toast(tr("Administrator authorization is unavailable"));
+                    return;
+                }
+                self.close_details();
+                self.auth = Some(AuthPrompt::new(
+                    PendingAuth::Action {
+                        package: Box::new(package.clone()),
+                        kind,
+                    },
+                    None,
+                ));
+                return;
+            }
+            self.show_toast(tr("Authorization requested — check the system dialog"));
+        }
+        self.spawn_action(package, kind, None);
+    }
+
+    /// Odpowiedź na okno hasła: uruchamia czekającą operację przez `sudo -S`.
+    pub fn submit_auth(&mut self) {
+        let Some(prompt) = self.auth.as_ref() else {
+            return;
+        };
+        let password = prompt.password.text().to_owned();
+        if password.is_empty() {
+            if let Some(prompt) = self.auth.as_mut() {
+                prompt.error = Some(tr("Enter your password"));
+            }
+            return;
+        }
+        let pending = prompt.pending.clone();
+        self.auth = None;
+        self.last_auth = Some(pending.clone());
+        match pending {
+            PendingAuth::Action { package, kind } => {
+                self.spawn_action(&package, kind, Some(password))
+            }
+            PendingAuth::UpdateAll => self.perform_update_all(Some(password)),
+            PendingAuth::InstallMany(packages) => {
+                self.perform_install_many(packages, Some(password))
+            }
+        }
+    }
+
+    pub fn cancel_auth(&mut self) {
+        self.auth = None;
+        self.last_auth = None;
+    }
+
+    fn spawn_action(&mut self, package: &Package, kind: ActionKind, password: Option<String>) {
+        let Some(repo) = self
+            .repos
+            .iter()
+            .find(|repo| repo.cfg.id == package.source)
+            .map(|repo| repo.cfg.clone())
+        else {
+            self.show_toast(tr("Source is not available"));
+            return;
+        };
         let label = match kind {
             ActionKind::Install => tr("Installing…"),
             ActionKind::Remove => tr("Removing…"),
             ActionKind::Update => tr("Updating…"),
             ActionKind::UpdateAll => tr("Updating all sources…"),
         };
-        // Zmiany systemowe wymagają autoryzacji (pkexec → agent polkit Luny).
-        if self.config.privilege != Privilege::None && needs_admin(&repo) {
-            self.show_toast(tr("Authorization requested — check the system dialog"));
-        }
+        self.op_started = Some(Instant::now());
+        crate::oplog::append(&format!("== {label}: {} ==", package.name));
         self.working = Some(format!("{label} {}", package.name));
         self.close_details();
         self.search.set_focused(false);
-        self.runner.spawn(Job::Action {
-            repo,
-            kind,
-            id: package.id.clone(),
-            name: package.name.clone(),
-            remote: package
-                .remote
-                .clone()
-                .or_else(|| package_remote(&package.source, &self.repos)),
-        });
+        self.runner.spawn_with_password(
+            Job::Action {
+                repo,
+                kind,
+                id: package.id.clone(),
+                name: package.name.clone(),
+                remote: package
+                    .remote
+                    .clone()
+                    .or_else(|| package_remote(&package.source, &self.repos)),
+            },
+            password,
+        );
     }
 
     /// Klik w przycisk karty.
@@ -332,6 +542,139 @@ impl App {
             let key = package.key();
             self.open_details(&key);
         }
+    }
+
+    /// Włącza/wyłącza tryb zaznaczania; wyjście czyści zaznaczenie.
+    pub fn toggle_select_mode(&mut self) {
+        self.select_mode = !self.select_mode;
+        if !self.select_mode {
+            self.selection.clear();
+        }
+    }
+
+    /// Czy pakiet jest zaznaczony w trybie zbiorczym.
+    pub fn is_selected(&self, package: &Package) -> bool {
+        self.selection.contains(&package.key())
+    }
+
+    /// Zaznacza/odznacza kartę widoku (tryb zbiorczy).
+    pub fn toggle_selection(&mut self, view_index: usize) {
+        let Some(&index) = self.view.get(view_index) else {
+            return;
+        };
+        let key = self.packages[index].key();
+        if !self.selection.remove(&key) {
+            self.selection.insert(key);
+        }
+    }
+
+    /// Zaznacza wszystkie pakiety widoczne na bieżącej stronie.
+    pub fn select_all_visible(&mut self) {
+        for &index in &self.view {
+            self.selection.insert(self.packages[index].key());
+        }
+    }
+
+    /// Zaznaczone pakiety w kolejności nazw.
+    pub fn selected_packages(&self) -> Vec<Package> {
+        let mut packages: Vec<Package> = self
+            .selection
+            .iter()
+            .filter_map(|key| {
+                self.index
+                    .get(key)
+                    .map(|&index| self.packages[index].clone())
+            })
+            .collect();
+        packages.sort_by(|a, b| a.sort_name.cmp(&b.sort_name));
+        packages
+    }
+
+    /// Zaznaczone pakiety, które faktycznie coś zainstalują/zaktualizują.
+    pub fn selection_actionable(&self) -> Vec<Package> {
+        self.selected_packages()
+            .into_iter()
+            .filter(|package| !package.is_installed() || package.has_update())
+            .collect()
+    }
+
+    /// Ile zaznaczonych pakietów ma coś do zrobienia (etykieta „Zainstaluj wszystkie”).
+    pub fn actionable_count(&self) -> usize {
+        self.selection_actionable().len()
+    }
+
+    /// „Zainstaluj wszystkie” — instaluje nowe pakiety i aktualizuje zaznaczone.
+    ///
+    /// Pakiety już zainstalowane bez aktualizacji są pomijane. Cała seria idzie
+    /// jednym wątkiem (sekwencyjnie), więc menedżer nie blokuje własnej bazy.
+    pub fn install_selected(&mut self) {
+        if self.working.is_some() {
+            self.show_toast(tr("Another operation is running"));
+            return;
+        }
+        let packages = self.selection_actionable();
+        if packages.is_empty() {
+            self.show_toast(tr("Select packages to install"));
+            return;
+        }
+        if self.config.privilege != Privilege::None {
+            if crate::admin::needs_password_prompt(self.config.privilege) {
+                if !crate::admin::available(self.config.privilege) {
+                    self.show_toast(tr("Administrator authorization is unavailable"));
+                    return;
+                }
+                self.close_details();
+                self.auth = Some(AuthPrompt::new(PendingAuth::InstallMany(packages), None));
+                return;
+            }
+            self.show_toast(tr("Authorization requested — check the system dialog"));
+        }
+        self.perform_install_many(packages, None);
+    }
+
+    fn perform_install_many(&mut self, packages: Vec<Package>, password: Option<String>) {
+        let mut items = Vec::new();
+        for package in &packages {
+            let kind = if package.has_update() {
+                ActionKind::Update
+            } else if !package.is_installed() {
+                ActionKind::Install
+            } else {
+                continue;
+            };
+            let Some(repo) = self
+                .repos
+                .iter()
+                .find(|repo| repo.cfg.id == package.source)
+                .map(|repo| repo.cfg.clone())
+            else {
+                continue;
+            };
+            items.push(BulkAction {
+                repo,
+                kind,
+                id: package.id.clone(),
+                name: package.name.clone(),
+                remote: package
+                    .remote
+                    .clone()
+                    .or_else(|| package_remote(&package.source, &self.repos)),
+            });
+        }
+        if items.is_empty() {
+            self.show_toast(tr("Select packages to install"));
+            return;
+        }
+        let label = tr("Installing selected packages…");
+        self.op_started = Some(Instant::now());
+        self.working = Some(label.clone());
+        self.last_auth = password
+            .is_some()
+            .then_some(PendingAuth::InstallMany(packages));
+        self.close_details();
+        self.search.set_focused(false);
+        crate::oplog::append(&format!("== {label} =="));
+        self.runner.spawn_with_password(Job::Bulk(items), password);
     }
 
     pub fn open_details(&mut self, key: &str) {
@@ -373,6 +716,74 @@ impl App {
     pub fn close_details(&mut self) {
         self.sheet.set_open_animated(false);
         self.confirm_remove = false;
+    }
+
+    /// Prosi o otwarcie pakietu po wczytaniu katalogów (`luna-store --package`).
+    pub fn request_package(&mut self, query: impl Into<String>) {
+        let query = query.into();
+        if !query.trim().is_empty() {
+            self.pending_open = Some(query);
+        }
+    }
+
+    /// Próbuje otworzyć żądany pakiet — wołane co klatkę z pętli UI.
+    ///
+    /// Gdy katalogi jeszcze się wczytują, czekamy. Dopiero po zakończeniu
+    /// ładowania brak dopasowania pokazujemy jako wyszukiwanie i komunikat.
+    pub fn resolve_pending_open(&mut self) -> bool {
+        let Some(query) = self.pending_open.clone() else {
+            return false;
+        };
+        if let Some(index) = self.find_package(&query) {
+            self.pending_open = None;
+            self.page = Page::All;
+            self.search.set_text(self.packages[index].id.clone());
+            let key = self.packages[index].key();
+            self.open_details(&key);
+            self.dirty = true;
+            return true;
+        }
+        if self.loading.is_empty() && !self.packages.is_empty() {
+            self.pending_open = None;
+            self.page = Page::All;
+            self.search.set_text(query);
+            self.search_active = true;
+            self.dirty = true;
+            self.show_toast(tr("Package not found"));
+        }
+        false
+    }
+
+    /// Dopasowuje nazwę z launchera (np. `org.gnome.Nautilus`) do pakietu.
+    fn find_package(&self, query: &str) -> Option<usize> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return None;
+        }
+        let mut aliases = vec![query.clone()];
+        if let Some(last) = query.rsplit('.').next() {
+            if last != query {
+                aliases.push(last.to_owned());
+            }
+        }
+        let matches = |package: &Package, needle: &str| {
+            package.id.to_lowercase() == needle || package.name.to_lowercase() == needle
+        };
+        // Najpierw zainstalowane (to one mają przycisk „Usuń”), potem cały katalog.
+        for installed_only in [true, false] {
+            for alias in &aliases {
+                if let Some(index) = self.packages.iter().position(|package| {
+                    (!installed_only || package.is_installed()) && matches(package, alias)
+                }) {
+                    return Some(index);
+                }
+            }
+        }
+        self.packages.iter().position(|package| {
+            package.is_installed()
+                && (package.id.to_lowercase().contains(&query)
+                    || package.name.to_lowercase().contains(&query))
+        })
     }
 
     pub fn selected_package(&self) -> Option<&Package> {
@@ -495,6 +906,12 @@ impl App {
     }
 
     pub fn sync_view(&mut self) {
+        // Zaznaczenie może wskazywać na pakiety, których już nie ma po zmianie
+        // źródła — usuwamy martwe klucze, żeby „Zainstaluj wszystkie” ich nie goniło.
+        if !self.selection.is_empty() {
+            let index = &self.index;
+            self.selection.retain(|key| index.contains_key(key));
+        }
         let query = self.search.text().trim().to_lowercase();
         let signature = ViewSignature {
             version: self.data_version,
@@ -522,6 +939,7 @@ impl App {
                 .filter(|(_, package)| package.has_update())
                 .map(|(index, _)| index)
                 .collect(),
+            Page::Status => Vec::new(),
             Page::Source(source) => self
                 .packages
                 .iter()
@@ -704,6 +1122,7 @@ impl App {
                 }
                 JobResult::ActionDone(outcome) => {
                     self.working = None;
+                    self.op_started = None;
                     if outcome.success {
                         let message = match outcome.kind {
                             ActionKind::Install => {
@@ -718,20 +1137,144 @@ impl App {
                             ActionKind::UpdateAll => tr("All updates installed"),
                         };
                         self.show_toast(message);
+                        // Powiadomienie systemowe — użytkownik może kliknąć i wrócić
+                        // do Sklepu (powłoka aktywuje istniejące okno).
+                        match outcome.kind {
+                            ActionKind::Install => crate::notify::installed(&outcome.name),
+                            ActionKind::Remove => crate::notify::removed(&outcome.name),
+                            ActionKind::Update => crate::notify::updated(&outcome.name),
+                            ActionKind::UpdateAll => {
+                                crate::notify::updates_installed(&outcome.name)
+                            }
+                        }
                         if outcome.kind == ActionKind::UpdateAll {
                             self.refresh_statuses();
-                        } else if let Some(source) = outcome.source {
+                        } else if let Some(source) = outcome.source.clone() {
                             self.refresh_status(&source);
                         }
                         self.close_details();
+                        self.last_auth = None;
                     } else {
-                        let detail = outcome.detail.unwrap_or_default();
-                        let first = detail.lines().next().unwrap_or("").trim().to_owned();
-                        self.show_toast(format!("{}: {}", tr("Failed"), first));
+                        let detail = outcome.detail.clone().unwrap_or_default();
+                        let lower = detail.to_lowercase();
+                        let auth_error = lower.contains("sorry, try again")
+                            || lower.contains("incorrect password")
+                            || lower.contains("authentication failure");
+                        let dismissed = lower.contains("dismissed")
+                            || lower.contains("cancelled")
+                            || lower.contains("canceled");
+                        if auth_error && self.last_auth.is_some() {
+                            // Złe hasło: wracamy do formularza zamiast zamykać go z błędem.
+                            self.auth = Some(AuthPrompt::new(
+                                self.last_auth.clone().unwrap(),
+                                Some(tr("Incorrect password. Try again.")),
+                            ));
+                        } else if dismissed {
+                            // Użytkownik zamknął okno polkit — to nie jest błąd,
+                            // który powinien wisieć jako trwałe powiadomienie.
+                            self.show_toast(tr("Cancelled"));
+                        } else {
+                            let first = detail.lines().next().unwrap_or("").trim().to_owned();
+                            self.show_toast(format!("{}: {}", tr("Failed"), first));
+                            crate::notify::failed(if first.is_empty() { &detail } else { &first });
+                        }
                     }
+                    self.op_history.push(OpRecord {
+                        kind: outcome.kind,
+                        name: outcome.name,
+                        success: outcome.success,
+                        detail: outcome.detail,
+                        finished: SystemTime::now(),
+                    });
+                    if self.op_history.len() > 50 {
+                        self.op_history.remove(0);
+                    }
+                    self.op_log = crate::oplog::tail(200);
+                }
+                JobResult::BulkDone(outcomes) => {
+                    self.working = None;
+                    self.op_started = None;
+                    let mut successes: Vec<String> = Vec::new();
+                    let mut all_updates = true;
+                    let mut first_failure: Option<String> = None;
+                    let mut auth_error = false;
+                    let mut sources: HashSet<String> = HashSet::new();
+                    for outcome in outcomes {
+                        if let Some(source) = &outcome.source {
+                            sources.insert(source.clone());
+                        }
+                        if outcome.success {
+                            successes.push(outcome.name.clone());
+                            if outcome.kind != ActionKind::Update {
+                                all_updates = false;
+                            }
+                        } else if first_failure.is_none() {
+                            let detail = outcome.detail.clone().unwrap_or_default();
+                            let lower = detail.to_lowercase();
+                            auth_error = lower.contains("sorry, try again")
+                                || lower.contains("incorrect password")
+                                || lower.contains("authentication failure");
+                            first_failure = Some(detail);
+                        }
+                        self.op_history.push(OpRecord {
+                            kind: outcome.kind,
+                            name: outcome.name.clone(),
+                            success: outcome.success,
+                            detail: outcome.detail.clone(),
+                            finished: SystemTime::now(),
+                        });
+                    }
+                    while self.op_history.len() > 50 {
+                        self.op_history.remove(0);
+                    }
+                    if let Some(detail) = first_failure {
+                        if auth_error && self.last_auth.is_some() {
+                            // Cała seria czeka na poprawne hasło.
+                            self.auth = Some(AuthPrompt::new(
+                                self.last_auth.clone().unwrap(),
+                                Some(tr("Incorrect password. Try again.")),
+                            ));
+                        } else {
+                            let first = detail.lines().next().unwrap_or("").trim().to_owned();
+                            self.show_toast(format!("{}: {}", tr("Failed"), first));
+                            crate::notify::failed(if first.is_empty() { &detail } else { &first });
+                        }
+                    } else {
+                        let names = successes.join(", ");
+                        let summary = if all_updates {
+                            tr("Updated")
+                        } else {
+                            tr("Installed")
+                        };
+                        self.show_toast(format!("{summary}: {names}"));
+                        if all_updates {
+                            crate::notify::updated(&names);
+                        } else {
+                            crate::notify::installed(&names);
+                        }
+                        // Po udanej serii odblokowujemy listę i wychodzimy z trybu
+                        // zaznaczania — można od razu wybrać kolejne pakiety.
+                        self.last_auth = None;
+                        self.selection.clear();
+                        self.select_mode = false;
+                    }
+                    for source in sources {
+                        self.refresh_status(&source);
+                    }
+                    self.op_log = crate::oplog::tail(200);
                 }
             }
         }
+        // Powiadamiaj tylko przy wzroście liczby aktualizacji — bez powtarzania
+        // tego samego komunikatu przy każdym odświeżeniu.
+        let updates = self.update_count();
+        if updates > self.notified_updates {
+            crate::notify::updates_available(updates);
+        }
+        if updates != self.notified_updates {
+            cache::save_notified_updates(updates);
+        }
+        self.notified_updates = updates;
         self.sync_view();
     }
 
@@ -741,6 +1284,24 @@ impl App {
         // czyli są „otwarte”, ale niewidoczne (i blokują wejście jak modal).
         self.sheet.advance(dt, 0.22);
         self.toast.advance(dt, 0.28);
+        // Proces uruchomiony wcześniej (np. pkexec po zamknięciu okna) jest
+        // wykrywany po pliku PID — strona Status pokazuje go jako „w tle”.
+        let background = crate::oplog::running_pid().is_some();
+        if background != self.background {
+            self.background = background;
+            self.log_read_at = Instant::now() - Duration::from_secs(10);
+            if !background {
+                // Zakończyła się operacja, której nie śledził ten proces UI.
+                self.refresh_statuses();
+            }
+        }
+        // Strona „Status” i trwająca operacja czytają ogon dziennika (max 2 Hz).
+        if (self.page == Page::Status || self.working.is_some() || self.background)
+            && self.log_read_at.elapsed() >= Duration::from_millis(500)
+        {
+            self.op_log = crate::oplog::tail(200);
+            self.log_read_at = Instant::now();
+        }
         if let Some(until) = self.toast_until {
             if Instant::now() >= until {
                 self.toast.set_open_animated(false);
@@ -752,6 +1313,8 @@ impl App {
     pub fn needs_frames(&self) -> bool {
         !self.loading.is_empty()
             || self.working.is_some()
+            || self.background
+            || crate::oplog::running_pid().is_some()
             || self.sheet.is_animating()
             || self.toast.is_animating()
             || self.toast_until.is_some()
@@ -777,6 +1340,10 @@ impl App {
     }
 
     pub fn status_page(&self) -> Option<StatusPage> {
+        // „Status” ma własny widok (dziennik + historia operacji).
+        if self.page == Page::Status {
+            return None;
+        }
         if self.repos.is_empty() {
             return Some(
                 StatusPage::new(tr("No package manager detected"))
@@ -840,16 +1407,77 @@ impl App {
             3 => self.go_to(Page::All),
             4 => self.go_to(Page::Installed),
             5 => self.go_to(Page::Updates),
-            7 => self.open_configuration(),
-            8 => self.show_toast(format!(
-                "Luna Store {} · GPL-3.0-or-later",
-                env!("CARGO_PKG_VERSION")
-            )),
+            6 => self.toggle_select_mode(),
+            7 => self.go_to(Page::Status),
+            9 => self.open_configuration(),
+            10 => self.show_about(),
             _ => {}
         }
     }
 
-    fn open_configuration(&mut self) {
+    /// Okno „O aplikacji” z wersją, licencją i listą źródeł.
+    pub fn show_about(&mut self) {
+        let mut body = format!(
+            "Luna Store {}\n{}\n\n© 2026 Luna Project · GPL-3.0-or-later",
+            env!("CARGO_PKG_VERSION"),
+            tr("Install and update software.")
+        );
+        if let Some(path) = &self.config.path {
+            body.push_str(&format!("\n\n{}: {}", tr("Configuration"), path.display()));
+        }
+        if !self.repos.is_empty() {
+            let names = self
+                .repos
+                .iter()
+                .map(|repo| repo.cfg.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            body.push_str(&format!("\n{}: {names}", tr("Sources")));
+        }
+        self.about = Some(
+            AlertDialog::new(tr("About"), body)
+                .width(560.0)
+                .button(tr("Done")),
+        );
+    }
+
+    /// Okno „Konfiguracja repozytorium” — ścieżka, źródła i otwarcie pliku.
+    pub fn open_configuration(&mut self) {
+        let Some(path) = self.config.path.clone() else {
+            self.show_toast(tr("No configuration file"));
+            return;
+        };
+        let mut lines = vec![path.display().to_string(), String::new()];
+        if let Some(warning) = &self.config.warning {
+            lines.push(format!("{}: {warning}", tr("Configuration error")));
+            lines.push(String::new());
+        }
+        if self.repos.is_empty() {
+            lines.push(tr("No package manager detected"));
+        } else {
+            for repo in &self.repos {
+                lines.push(format!(
+                    "{} · {} · {}",
+                    repo.cfg.name,
+                    repo.cfg.backend,
+                    if repo.cfg.is_active() {
+                        tr("Enabled")
+                    } else {
+                        tr("Disabled")
+                    }
+                ));
+            }
+        }
+        self.config_info = Some(
+            AlertDialog::new(tr("Repository configuration"), lines.join("\n"))
+                .width(620.0)
+                .button(tr("Open file"))
+                .button(tr("Done")),
+        );
+    }
+
+    /// Otwiera plik konfiguracji w domyślnym edytorze (`xdg-open`).
+    pub fn open_config_file(&mut self) {
         let Some(path) = self.config.path.clone() else {
             self.show_toast(tr("No configuration file"));
             return;
@@ -953,6 +1581,7 @@ impl App {
             (tr("All apps"), IconName::Store, Page::All),
             (tr("Installed"), IconName::Check, Page::Installed),
             (updates_label, IconName::Clock, Page::Updates),
+            (tr("Status"), IconName::Info, Page::Status),
         ] {
             entries.push(NavEntry::Item(label));
             icons.push(Some(icon));
@@ -1143,6 +1772,8 @@ fn menu_entries() -> Vec<MenuEntry> {
         MenuEntry::action(tr("All apps")),
         MenuEntry::action(tr("Installed")),
         MenuEntry::action(tr("Updates")),
+        MenuEntry::action(tr("Select packages")),
+        MenuEntry::action(tr("Status")),
         MenuEntry::separator(),
         MenuEntry::action(tr("Open repository configuration")),
         MenuEntry::action(tr("About")),
@@ -1202,6 +1833,39 @@ fn truncate(text: &str, max: usize) -> String {
     out
 }
 
+/// Obsługuje argumenty startowe Sklepu.
+///
+/// - `--package <id>` / `-p` — otwiera szczegóły pakietu (używane przez launcher
+///   przy „Odinstaluj”); akceptuje też `--package=<id>`.
+/// - `--search <fraza>` / `-s` — wypełnia wyszukiwanie.
+fn apply_cli_args(app: &mut App) {
+    let mut package: Option<String> = None;
+    let mut search: Option<String> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--package" | "-p" => package = args.next(),
+            "--search" | "-s" => search = args.next(),
+            _ => {
+                if let Some(value) = arg.strip_prefix("--package=") {
+                    package = Some(value.to_owned());
+                } else if let Some(value) = arg.strip_prefix("--search=") {
+                    search = Some(value.to_owned());
+                }
+            }
+        }
+    }
+    if let Some(query) = search {
+        app.page = Page::All;
+        app.search.set_text(query);
+        app.search_active = true;
+        app.dirty = true;
+    }
+    if let Some(query) = package {
+        app.request_package(query);
+    }
+}
+
 /// Uruchamia Luna Store.
 pub fn run() -> Result<(), Box<dyn Error>> {
     set_locale(libluna_i18n::preferred_locale());
@@ -1214,6 +1878,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     let mut app = App::new();
     app.start_initial_jobs();
+    apply_cli_args(&mut app);
     let mut ui_language = libluna_i18n::locale().language().to_owned();
     let title = tr("Store");
 
@@ -1237,6 +1902,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
 
         app.poll_jobs();
+        app.resolve_pending_open();
         crate::ui::handle_events(&mut app, frame.events, frame.size, &frame.theme, frame.text);
 
         if let Some(text) = app.clipboard_text.take() {
@@ -1401,6 +2067,49 @@ mod tests {
     }
 
     #[test]
+    fn bulk_selection_counts_only_actionable_packages() {
+        let mut app = test_app();
+        app.go_to(Page::All);
+        app.toggle_select_mode();
+        app.select_all_visible();
+        assert_eq!(app.selection.len(), 2);
+        // Firefoksa trzeba zainstalować, GIMP ma aktualizację — oba są do zrobienia.
+        assert_eq!(app.actionable_count(), 2);
+
+        // Po oznaczeniu Firefoksa jako zainstalowanego (bez aktualizacji)
+        // zostaje tylko GIMP.
+        let source = app.repos[0].cfg.id.clone();
+        app.installed
+            .get_mut(&source)
+            .unwrap()
+            .insert("firefox".into(), "130".into());
+        app.rebuild_source_packages(&source);
+        app.data_version = app.data_version.wrapping_add(1);
+        app.sync_view();
+        assert_eq!(app.actionable_count(), 1);
+    }
+
+    #[test]
+    fn leaving_select_mode_clears_the_selection() {
+        let mut app = test_app();
+        app.go_to(Page::All);
+        app.toggle_select_mode();
+        app.select_all_visible();
+        assert!(!app.selection.is_empty());
+        app.toggle_select_mode();
+        assert!(!app.select_mode);
+        assert!(app.selection.is_empty());
+    }
+
+    #[test]
+    fn install_all_without_selection_does_not_start_a_job() {
+        let mut app = test_app();
+        app.toggle_select_mode();
+        app.install_selected();
+        assert!(app.working.is_none());
+    }
+
+    #[test]
     fn navigation_clears_the_query() {
         let mut app = test_app();
         app.search.set_text("gimp");
@@ -1447,6 +2156,52 @@ mod tests {
         assert!(!app.action_requires_admin());
         app.config.privilege = Privilege::Pkexec;
         assert!(app.action_requires_admin());
+    }
+
+    #[test]
+    fn update_all_asks_before_running() {
+        let mut app = test_app();
+        assert_eq!(app.update_count(), 1);
+        app.update_all();
+        assert!(app.confirm_update_all.is_some());
+        assert!(app.working.is_none());
+        app.answer_update_all(false);
+        assert!(app.confirm_update_all.is_none());
+        assert!(app.working.is_none());
+    }
+
+    #[test]
+    fn menu_opens_about_status_and_configuration() {
+        let mut app = test_app();
+        app.config.path = Some(std::path::PathBuf::from("/tmp/repositories.conf"));
+
+        app.menu_action(10);
+        assert!(app.about.is_some());
+        app.about = None;
+
+        app.menu_action(9);
+        assert!(app.config_info.is_some());
+        app.config_info = None;
+
+        app.menu_action(7);
+        assert_eq!(app.page, Page::Status);
+        assert!(app.view.is_empty());
+        assert!(app.status_page().is_none());
+    }
+
+    #[test]
+    fn finished_operation_is_recorded_in_history() {
+        let mut app = test_app();
+        app.op_history.push(OpRecord {
+            kind: ActionKind::Install,
+            name: "Firefox".into(),
+            success: true,
+            detail: None,
+            finished: SystemTime::now(),
+        });
+        app.go_to(Page::Status);
+        assert_eq!(app.op_history.len(), 1);
+        assert_eq!(app.op_history[0].name, "Firefox");
     }
 
     #[test]
@@ -1503,5 +2258,15 @@ mod tests {
             .nav_pages
             .iter()
             .any(|page| matches!(page, Some(Page::Source(_)))));
+    }
+
+    #[test]
+    fn package_request_matches_desktop_id_alias() {
+        let app = test_app();
+        // Launcher przekazuje nazwę pliku `.desktop`, np. `org.gnome.Gimp`.
+        assert!(app.find_package("org.gnome.Gimp").is_some());
+        assert!(app.find_package("gimp").is_some());
+        assert!(app.find_package("org.mozilla.firefox").is_some());
+        assert!(app.find_package("nie-ma-takiego").is_none());
     }
 }

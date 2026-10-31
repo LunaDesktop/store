@@ -1,6 +1,6 @@
 [package]
 name = "luna-store"
-version = "0.0.2"
+version = "0.0.1"
 edition = "2021"
 license = "GPL-3.0-or-later"
 rust-version = "1.80"
@@ -19,6 +19,9 @@ libluna-render = { git = "https://github.com/LunaDesktop/libLuna.git", version =
 libluna-platform = { git = "https://github.com/LunaDesktop/libLuna.git", version = "0.0.6" }
 libluna-widgets = { git = "https://github.com/LunaDesktop/libLuna.git", version = "0.0.6" }
 serde_json = "1.0"
+# Powiadomienia systemowe (`org.freedesktop.Notifications`) — bez `notify-send`,
+# żeby działały również wtedy, gdy nie ma narzędzi XDG w `PATH`.
+zbus = { version = "5.19", features = ["blocking-api"] }
 
 [profile.dev.package."*"]
 opt-level = 2
