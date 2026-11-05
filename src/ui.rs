@@ -14,8 +14,8 @@ use libluna_core::{
 use libluna_i18n::{tr, tr_args};
 use libluna_render::{Scene, TextEngine};
 use libluna_widgets::{
-    clipboard_command, paint_icon, AlertDialog, Button, ButtonVariant, ControlsSide, HeaderBar,
-    IconName, PaintCtx, Spinner, TextClipboardCommand, ViewMode, WindowControl,
+    clipboard_command, paint_icon, sidebar_icon, AlertDialog, Button, ButtonVariant, ControlsSide,
+    HeaderBar, IconName, PaintCtx, Spinner, TextClipboardCommand, ViewMode, WindowControl,
 };
 
 use crate::app::{source_icon, App, OpRecord, Page};
@@ -416,10 +416,10 @@ pub fn paint(app: &App, scene: &mut Scene, size: Size, theme: &Theme, text: &Tex
         .paint(&mut ctx, lay.header, app.hover_control);
 
     paint_header_button(&mut ctx, lay.sidebar_toggle, app.hover_sidebar, false);
-    paint_sidebar_icon(
+    sidebar_icon(
         &mut ctx,
-        lay.sidebar_toggle,
         colors.text,
+        lay.sidebar_toggle,
         app.sidebar_visible,
     );
 
@@ -478,7 +478,12 @@ pub fn paint(app: &App, scene: &mut Scene, size: Size, theme: &Theme, text: &Tex
     } else {
         colors.text
     };
-    paint_refresh_icon(&mut ctx, lay.refresh, refresh_color);
+    paint_icon(
+        &mut ctx,
+        IconName::Refresh,
+        lay.refresh.deflate(Insets::splat(6.0)),
+        refresh_color,
+    );
 
     paint_header_button(&mut ctx, lay.select, app.hover_select, app.select_mode);
     paint_icon(
@@ -606,42 +611,6 @@ fn paint_header_button(ctx: &mut PaintCtx, rect: Rect, hover: bool, active: bool
     }
 }
 
-/// Łuk ze strzałką „odświeżania” — spójny z ikoną w pozostałych aplikacjach Luny.
-fn paint_refresh_icon(ctx: &mut PaintCtx, rect: Rect, color: Color) {
-    let center = rect.center();
-    let radius = rect.width() * 0.31;
-    let steps = 22;
-    let mut points = Vec::with_capacity(steps + 1);
-    for index in 0..=steps {
-        let angle = (40.0 + index as f64 * (280.0 / steps as f64)).to_radians();
-        points.push(Point::new(
-            center.x + radius * angle.cos(),
-            center.y + radius * angle.sin(),
-        ));
-    }
-    ctx.scene.stroke_polyline(&points, 1.6, color);
-    // Grot na końcu łuku (kierunek stycznej).
-    if points.len() >= 2 {
-        let tip = points[points.len() - 1];
-        let previous = points[points.len() - 2];
-        let dx = tip.x - previous.x;
-        let dy = tip.y - previous.y;
-        let length = (dx * dx + dy * dy).sqrt().max(0.001);
-        let (ux, uy) = (dx / length, dy / length);
-        let size = rect.width() * 0.20;
-        let back = Point::new(tip.x - ux * size, tip.y - uy * size);
-        let (px, py) = (-uy * size * 0.62, ux * size * 0.62);
-        ctx.scene.fill_polygon(
-            &[
-                tip,
-                Point::new(back.x + px, back.y + py),
-                Point::new(back.x - px, back.y - py),
-            ],
-            color,
-        );
-    }
-}
-
 /// Etykieta przycisku zbiorczego z liczbą pakietów do zrobienia.
 fn install_all_label(app: &App) -> String {
     tr_args(
@@ -715,17 +684,6 @@ fn paint_selection_bar(app: &App, ctx: &mut PaintCtx, lay: &Layout) {
 }
 
 /// Ikona przełącznika paska bocznego (◧ / ▭) — spójna z Luna Files.
-fn paint_sidebar_icon(ctx: &mut PaintCtx, rect: Rect, color: Color, filled: bool) {
-    let c = rect.center();
-    let (w, h) = (18.0, 14.0);
-    let outer = Rect::from_xywh(c.x - w / 2.0, c.y - h / 2.0, w, h);
-    ctx.scene.stroke_rounded_rect(outer, 3.0, 1.5, color);
-    if filled {
-        let inner = Rect::from_xywh(outer.x() + 2.0, outer.y() + 2.0, w * 0.36, h - 4.0);
-        ctx.scene.fill_rounded_rect(inner, 2.0, color);
-    }
-}
-
 /// Ikona odświeżania (okrągła strzałka) rysowana wektorowo.
 fn menu_panel(
     app: &App,
@@ -1735,6 +1693,7 @@ pub fn handle_events(
     for event in events {
         match event {
             Event::PointerMotion { position, .. } => {
+                app.pointer = Some(*position);
                 app.hover_control = HeaderBar::new()
                     .controls(ControlsSide::Right)
                     .control_at(lay.header, theme, *position);
@@ -1779,6 +1738,7 @@ pub fn handle_events(
                 app.hover_action = hover_action;
             }
             Event::PointerLeave => {
+                app.pointer = None;
                 app.hover_control = None;
                 app.hover_card = None;
                 app.hover_action = false;
@@ -1980,6 +1940,7 @@ fn handle_auth_events(
     for event in events {
         match event {
             Event::PointerMotion { position, .. } => {
+                app.pointer = Some(*position);
                 let peek = app
                     .auth
                     .as_mut()
@@ -1989,6 +1950,7 @@ fn handle_auth_events(
                     prompt.password.set_peek_hover(peek);
                 }
             }
+            Event::PointerLeave => app.pointer = None,
             Event::PointerButton(pe)
                 if pe.button == PointerButton::Left && pe.state == ButtonState::Pressed =>
             {
@@ -2091,10 +2053,13 @@ fn paint_auth(app: &App, ctx: &mut PaintCtx, size: Size) {
             tr_args("Install all ({n})", &[("n", &packages.len().to_string())])
         }
     };
-    Button::new(label)
-        .variant(ButtonVariant::Suggested)
-        .paint(ctx, lay.submit);
-    Button::new(tr("Cancel")).paint(ctx, lay.cancel);
+    let pointer = app.pointer;
+    let mut submit = Button::new(label).variant(ButtonVariant::Suggested);
+    submit.set_hovered(pointer.is_some_and(|p| lay.submit.contains(p)));
+    submit.paint(ctx, lay.submit);
+    let mut cancel = Button::new(tr("Cancel"));
+    cancel.set_hovered(pointer.is_some_and(|p| lay.cancel.contains(p)));
+    cancel.paint(ctx, lay.cancel);
 }
 
 fn handle_click(

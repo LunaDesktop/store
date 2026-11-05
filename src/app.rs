@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::time::{Duration, Instant, SystemTime};
 
-use libluna_core::ThemeSettings;
+use libluna_core::{Point, ThemeSettings};
 use libluna_i18n::{set_locale, tr, tr_args};
 use libluna_platform::{run as run_app, AppConfig, Frame};
 use libluna_widgets::{
@@ -168,6 +168,8 @@ pub struct App {
     /// Ogon dziennika operacji (odświeżany w `tick`).
     pub op_log: Vec<String>,
     log_read_at: Instant,
+    /// Kiedy ostatnio wykonano automatyczny sync (start / ręczne odświeżenie).
+    last_sync: Instant,
     /// Kiedy zaczął się trwający proces (do licznika na stronie Status).
     pub op_started: Option<Instant>,
     /// Czy trwa operacja zapisana w cache (np. pkexec po restarcie UI).
@@ -177,6 +179,8 @@ pub struct App {
     pub spinner: f64,
     pub pending: Pending,
     pub hover_control: Option<WindowControl>,
+    /// Ostatnia pozycja kursora — podświetlenie przycisków w dialogach.
+    pub pointer: Option<Point>,
     pub hover_card: Option<usize>,
     pub hover_action: bool,
     pub hover_refresh: bool,
@@ -270,6 +274,7 @@ impl App {
             notified_updates: cache::load_notified_updates(),
             op_log: Vec::new(),
             log_read_at: Instant::now() - Duration::from_secs(10),
+            last_sync: Instant::now(),
             op_started: None,
             background: false,
             toast: Toast::default(),
@@ -277,6 +282,7 @@ impl App {
             spinner: 0.0,
             pending: Pending::default(),
             hover_control: None,
+            pointer: None,
             hover_card: None,
             hover_action: false,
             hover_refresh: false,
@@ -326,6 +332,7 @@ impl App {
             }
             self.spawn_status(repo);
         }
+        self.last_sync = Instant::now();
     }
 
     pub fn refresh_all(&mut self) {
@@ -343,6 +350,7 @@ impl App {
             self.spawn_catalog(repo.clone());
             self.spawn_status(repo);
         }
+        self.last_sync = Instant::now();
     }
 
     /// Pyta o potwierdzenie aktualizacji wszystkich pakietów.
@@ -1308,6 +1316,9 @@ impl App {
                 self.toast_until = None;
             }
         }
+        if self.auto_sync_due() {
+            self.auto_sync();
+        }
     }
 
     pub fn needs_frames(&self) -> bool {
@@ -1599,7 +1610,7 @@ impl App {
             }
         }
 
-        self.nav = NavList::new(entries);
+        self.nav = NavList::new(entries).monochrome(true);
         self.nav.set_icons(icons);
         self.nav_pages = pages;
         self.select_nav();
@@ -1722,6 +1733,7 @@ impl App {
     }
 
     fn refresh_status(&mut self, source: &str) {
+        self.last_sync = Instant::now();
         if let Some(repo) = self
             .repos
             .iter()
@@ -1733,8 +1745,32 @@ impl App {
     }
 
     fn refresh_statuses(&mut self) {
+        self.last_sync = Instant::now();
         let repos: Vec<RepoConfig> = self.repos.iter().map(|repo| repo.cfg.clone()).collect();
         for repo in repos {
+            self.spawn_status(repo);
+        }
+    }
+
+    /// Czy minął czas `refresh_minutes` i można sprawdzić aktualizacje w tle?
+    fn auto_sync_due(&self) -> bool {
+        let interval = Duration::from_secs(self.config.refresh_minutes.saturating_mul(60).max(60));
+        !self.repos.is_empty()
+            && self.working.is_none()
+            && !self.background
+            && self.loading.is_empty()
+            && self.auth.is_none()
+            && self.last_sync.elapsed() >= interval
+    }
+
+    /// Cykliczny sync: statusy aktualizacji zawsze, katalogi tylko gdy cache przestarzały.
+    fn auto_sync(&mut self) {
+        self.last_sync = Instant::now();
+        let repos: Vec<RepoConfig> = self.repos.iter().map(|repo| repo.cfg.clone()).collect();
+        for repo in repos {
+            if cache::is_stale(&repo.id, self.config.refresh_minutes) {
+                self.spawn_catalog(repo.clone());
+            }
             self.spawn_status(repo);
         }
     }
@@ -2258,6 +2294,22 @@ mod tests {
             .nav_pages
             .iter()
             .any(|page| matches!(page, Some(Page::Source(_)))));
+    }
+
+    #[test]
+    fn auto_sync_waits_for_interval_and_skips_busy_states() {
+        let mut app = test_app();
+        app.config.refresh_minutes = 1;
+        app.loading.clear();
+        app.last_sync = Instant::now() - Duration::from_secs(61);
+        assert!(app.auto_sync_due());
+
+        app.working = Some("test".into());
+        assert!(!app.auto_sync_due());
+        app.working = None;
+
+        app.last_sync = Instant::now();
+        assert!(!app.auto_sync_due());
     }
 
     #[test]
