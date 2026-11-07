@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Store
+Name[pl]=Sklep
+Name[de]=Store
+Comment=Install and update software
+Comment[pl]=Instaluj i aktualizuj oprogramowanie
+Comment[de]=Software installieren und aktualisieren
+Exec=luna-store
+Icon=system-software-install
+Terminal=false
+Categories=System;PackageManager;Settings;
+Keywords=store;software;packages;flatpak;updates;
+Keywords[pl]=sklep;oprogramowanie;pakiety;flatpak;aktualizacje;
+Keywords[de]=Store;Software;Pakete;Flatpak;Aktualisierungen;

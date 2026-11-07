@@ -42,3 +42,16 @@ jobs:
         with:
           files: "*.tar.gz"
           generate_release_notes: true
+
+  distro:
+    needs: build
+    uses: LunaDesktop/luna/.github/workflows/distro-packages.yml@main
+    with:
+      package: "luna-store"
+      description: "Luna Store — sklep z aplikacjami"
+      binaries: "luna-store"
+      files: |
+        packaging/eu.luna.Store.desktop:/usr/share/applications/eu.luna.Store.desktop:644
+      deb_depends: "libc6,libxkbcommon0,libxcursor1,libwayland-client0"
+      rpm_depends: "glibc,libxkbcommon,libXcursor,libwayland-client"
+      arch_depends: "glibc,libxkbcommon,libxcursor,wayland"
